@@ -50,6 +50,13 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
 
 
+def remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def probe(path):
     """Return (duration_seconds, has_video, audio_tracks) where audio_tracks is a list of titles."""
     r = run(["ffprobe", "-v", "error", "-show_entries",
@@ -100,7 +107,8 @@ def load_model(msst_dir, model_path, config_path, device_name):
     from utils.utils import get_model_from_config
 
     model, config = get_model_from_config("bandit_v2", config_path)
-    state = torch.load(model_path, map_location="cpu", weights_only=False)
+    # weights_only: a checkpoint is only ever read as data, never run as code.
+    state = torch.load(model_path, map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:  # raw Lightning checkpoint
         state = {k[len("model."):]: v for k, v in state["state_dict"].items() if k.startswith("model.")}
     model.load_state_dict(state)
@@ -145,7 +153,8 @@ def process_file(index, path, args, model, config, device):
 
     out_dir = args.outdir or os.path.dirname(os.path.abspath(path))
     os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(path))[0]
+    # The app passes "name" when two queued files would otherwise produce the same output names.
+    base = getattr(args, "name", "") or os.path.splitext(os.path.basename(path))[0]
     ext = os.path.splitext(path)[1].lower()
 
     want_video = args.video and has_video
@@ -169,13 +178,22 @@ def process_file(index, path, args, model, config, device):
         for stem in ("speech", "sfx", "music"):
             plan[stem] = (os.path.join(out_dir, f"{base} - {stem}.wav"), True)
 
+    # Everything is written under a ".partial" name first. Requested files are renamed when they are
+    # complete; helper files that are only needed to build the video keep the temporary name and are
+    # deleted afterwards. Whatever happens, no ".partial" file is left behind (see the finally below).
     partial = {k: final[:-4] + ".partial.wav" for k, (final, _) in plan.items()}
-    writers = {k: sf.SoundFile(p, "w", samplerate=SR, channels=CHANNELS, subtype="PCM_24", format="WAV") for k, p in partial.items()}
+    video_part = None
+    # A 24-bit stereo WAV passes the format's 4 GB limit after about 4 hours. RF64 is the same file
+    # without the limit, and editors and ffmpeg read it as a normal .wav.
+    wav_format = "RF64" if (duration + 60) * SR * CHANNELS * 3 >= 0xFFF00000 else "WAV"
+    writers = {}
     clipped = 0
     seg = float(args.segment_seconds)
     pad = 5.0
     start = 0.0
     try:
+        for k, p in partial.items():
+            writers[k] = sf.SoundFile(p, "w", samplerate=SR, channels=CHANNELS, subtype="PCM_24", format=wav_format)
         while start < duration:
             pre = min(pad, start)
             game = decode(path, game_t, start - pre, pre + seg + pad, np)
@@ -211,49 +229,54 @@ def process_file(index, path, args, model, config, device):
             if n < int(round(seg * SR)):  # reached end of audio
                 break
             start += seg
-    finally:
         for w in writers.values():
             w.close()
 
-    for k, (final, _) in plan.items():
-        if os.path.exists(final):
-            os.remove(final)
-        os.replace(partial[k], final)
-    if clipped:
-        emit("log", message=f"{os.path.basename(path)}: {clipped} samples were above full scale and were clipped.")
+        # Where each finished WAV is now: its final name if the user asked for it, else still temporary.
+        ready = {}
+        for k, (final, requested) in plan.items():
+            if requested:
+                os.replace(partial[k], final)
+                ready[k] = final
+            else:
+                ready[k] = partial[k]
+        if clipped:
+            emit("log", message=f"{os.path.basename(path)}: {clipped} samples were above full scale and were clipped.")
 
-    outputs = [final for final, requested in plan.values() if requested]
+        outputs = [final for final, requested in plan.values() if requested]
 
-    if want_video:
-        emit("progress", index=index, value=0.995, stage="Writing video")
-        video_ext = ext if ext in (".mp4", ".mkv", ".mov", ".m4v", ".webm") else ".mkv"
-        audio_codec = ["-c:a", "libopus", "-b:a", "256k"] if video_ext == ".webm" else ["-c:a", "aac", "-b:a", "320k"]
-        final = os.path.join(out_dir, f"{base} (no music){video_ext}")
-        part = os.path.join(out_dir, f"{base} (no music).partial{video_ext}")
-        audio_inputs = [("clean", "Mix (no music)")]
-        if want_tracks:
-            audio_inputs += [("mic", "Mic"), ("game", "Game (no music)")]
-        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", path]
-        for key, _ in audio_inputs:
-            cmd += ["-i", plan[key][0]]
-        cmd += ["-map", "0:v"]
-        for i, (_, title) in enumerate(audio_inputs):
-            cmd += ["-map", f"{i + 1}:a:0", f"-metadata:s:a:{i}", f"title={title}"]
-        cmd += ["-c:v", "copy", *audio_codec, "-shortest"]
-        if video_ext in (".mp4", ".mov", ".m4v"):
-            cmd += ["-movflags", "+faststart"]
-        r = run(cmd + [part])
-        if r.returncode != 0:
-            if os.path.exists(part):
-                os.remove(part)
-            raise RuntimeError("ffmpeg could not write the video: " + r.stderr.decode(errors="replace").strip()[-300:])
-        os.replace(part, final)
-        outputs.append(final)
-
-    for final, requested in plan.values():  # helper files only needed for the video
-        if not requested and os.path.exists(final):
-            os.remove(final)
-    return outputs
+        if want_video:
+            emit("progress", index=index, value=0.995, stage="Writing video")
+            video_ext = ext if ext in (".mp4", ".mkv", ".mov", ".m4v", ".webm") else ".mkv"
+            audio_codec = ["-c:a", "libopus", "-b:a", "256k"] if video_ext == ".webm" else ["-c:a", "aac", "-b:a", "320k"]
+            final = os.path.join(out_dir, f"{base} (no music){video_ext}")
+            video_part = os.path.join(out_dir, f"{base} (no music).partial{video_ext}")
+            audio_inputs = [("clean", "Mix (no music)")]
+            if want_tracks:
+                audio_inputs += [("mic", "Mic"), ("game", "Game (no music)")]
+            cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", path]
+            for key, _ in audio_inputs:
+                cmd += ["-i", ready[key]]
+            cmd += ["-map", "0:v"]
+            for i, (_, title) in enumerate(audio_inputs):
+                cmd += ["-map", f"{i + 1}:a:0", f"-metadata:s:a:{i}", f"title={title}"]
+            cmd += ["-c:v", "copy", *audio_codec, "-shortest"]
+            if video_ext in (".mp4", ".mov", ".m4v"):
+                cmd += ["-movflags", "+faststart"]
+            r = run(cmd + [video_part])
+            if r.returncode != 0:
+                raise RuntimeError("ffmpeg could not write the video: " + r.stderr.decode(errors="replace").strip()[-300:])
+            os.replace(video_part, final)
+            outputs.append(final)
+        return outputs
+    finally:
+        # Unfinished files after an error, and helper files that were only needed for the video.
+        for w in writers.values():
+            w.close()
+        for p in partial.values():
+            remove_quietly(p)
+        if video_part:
+            remove_quietly(video_part)
 
 
 def make_sample(path, args, model, config, device):

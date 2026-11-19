@@ -10,9 +10,12 @@ const WINDOW: [f32; 2] = [880.0, 780.0];
 const FULL_PAGE: [f32; 2] = [880.0, 1440.0];
 
 fn job(path: &str, tracks: &[&str], duration: f64, status: Status) -> Job {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let path = PathBuf::from(path);
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     Job {
+        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        batch: 0,
         is_video: VIDEO_EXT.contains(&ext.as_str()),
         path,
         status,
@@ -50,10 +53,14 @@ fn fake_worker() -> Worker {
 fn processing(app: &mut App) {
     app.jobs = queue();
     app.jobs[0].status = done(&[r"E:\Streams\2026-11-14 Elden Ring part 12 (no music).mkv"], 1412.0);
-    app.jobs[0].opts = Some(JobOptions { multitrack: true, mic_track: 2, game_track: 3 });
     app.settings.multitrack = true;
     app.jobs[1].status = running(0.42, 560);
-    app.jobs[1].opts = Some(JobOptions { multitrack: true, mic_track: 2, game_track: 3 });
+    app.batch_id = 1;
+    for i in 0..2 {
+        let opts = JobOptions { multitrack: true, mic_track: 2, game_track: 3, out_dir: app.out_dir_for(&app.jobs[i]), base: app.out_base(&app.jobs[i]) };
+        app.jobs[i].opts = Some(opts);
+        app.jobs[i].batch = 1;
+    }
     app.batch_active = true;
     app.batch_started = Instant::now() - Duration::from_secs(1980);
     app.speed = Some(10.5);
@@ -114,6 +121,21 @@ fn render_screens() {
         app.jobs = queue();
         app.log("Starting the processing engine".to_string());
         app.dialog = Dialog::Settings;
+    });
+    render("10_close_confirmation", WINDOW, |app| {
+        processing(app);
+        app.dialog = Dialog::ConfirmClose;
+    });
+    render("11_same_name_files", WINDOW, |app| {
+        app.jobs = vec![
+            job(r"E:\Streams\2026-11-14 Elden Ring part 12.mkv", ONE, 4.0 * 3600.0 + 12.0 * 60.0, Status::Waiting),
+            job(r"E:\Streams\2026-11-14 Elden Ring part 12.wav", ONE, 4.0 * 3600.0 + 12.0 * 60.0, Status::Waiting),
+            job(r"E:\Streams\Two tracks only.mkv", &["Track 1", "Mic"], 1800.0, Status::Waiting),
+        ];
+        app.settings.multitrack = true;
+        app.settings.mic_track = 2;
+        app.settings.game_track = 3;
+        app.mode_touched = true;
     });
     render("09_listening_to_samples", WINDOW, |app| {
         app.jobs = queue();

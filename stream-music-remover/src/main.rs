@@ -5,6 +5,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(test)]
+mod logic_tests;
+#[cfg(test)]
 mod screens;
 mod theme;
 
@@ -21,6 +23,10 @@ use theme::*;
 
 const VIDEO_EXT: &[&str] = &["mp4", "mkv", "mov", "m4v", "flv", "ts", "webm", "avi"];
 const AUDIO_EXT: &[&str] = &["wav", "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma"];
+/// Containers a video result can be written as; anything else becomes an MKV.
+const VIDEO_OUT_EXT: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm"];
+/// How long an unused engine is kept loaded before it is closed to free the graphics card.
+const ENGINE_IDLE_LIMIT: Duration = Duration::from_secs(120);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -116,6 +122,40 @@ struct JobOptions {
     multitrack: bool,
     mic_track: u32,
     game_track: u32,
+    /// Folder the results are saved to.
+    out_dir: PathBuf,
+    /// Name the result files are based on (the recording's name, made unique within the list).
+    base: String,
+}
+
+/// Temporary files the worker may have on disk while it works on a file. It removes them itself
+/// when a file finishes or fails; these are what is left when it is stopped mid-file.
+fn partial_files(opts: &JobOptions) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = [" (no music)", " - mic", " - game (no music)", " - music", " - speech", " - sfx"]
+        .iter()
+        .map(|part| opts.out_dir.join(format!("{}{part}.partial.wav", opts.base)))
+        .collect();
+    files.extend(VIDEO_OUT_EXT.iter().map(|ext| opts.out_dir.join(format!("{} (no music).partial.{ext}", opts.base))));
+    files
+}
+
+/// Delete the unfinished files of an interrupted run, once the worker has let go of them.
+fn remove_partials(files: Vec<PathBuf>, child: &Mutex<Option<Child>>) {
+    for attempt in 0..40 {
+        let exited = child.lock().unwrap().as_mut().is_none_or(|c| !matches!(c.try_wait(), Ok(None)));
+        let mut left = false;
+        if exited {
+            for f in &files {
+                left |= f.exists() && std::fs::remove_file(f).is_err();
+            }
+            if !left {
+                return;
+            }
+        }
+        if attempt < 39 {
+            std::thread::sleep(Duration::from_millis(125));
+        }
+    }
 }
 
 // ---------- jobs & worker ----------
@@ -136,6 +176,10 @@ struct Probe {
 }
 
 struct Job {
+    /// Identifies the file to the worker. Never reused, so it stays valid when the list changes.
+    id: u64,
+    /// The run this file was last sent to the worker in (0 = not yet).
+    batch: u64,
     path: PathBuf,
     is_video: bool,
     status: Status,
@@ -213,10 +257,22 @@ struct Worker {
 }
 
 impl Worker {
+    /// End the worker and anything it started. ffmpeg runs as a child of the worker, and would
+    /// otherwise carry on writing in the background.
     fn kill(&self) {
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            let _ = child.kill();
+        let mut guard = self.child.lock().unwrap();
+        let Some(child) = guard.as_mut() else { return };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return; // already gone
         }
+        #[cfg(windows)]
+        {
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/PID", &child.id().to_string(), "/T", "/F"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            no_window(&mut cmd);
+            let _ = cmd.status();
+        }
+        let _ = child.kill();
     }
 }
 
@@ -291,6 +347,7 @@ enum Dialog {
     None,
     Settings,
     ConfirmStop,
+    ConfirmClose,
 }
 
 struct App {
@@ -322,6 +379,12 @@ struct App {
     worker_idle_since: Option<Instant>,
     adv_open: bool,
     log_open: bool,
+    /// Id for the next file added to the list.
+    next_id: u64,
+    /// Number of the current (or latest) run; files carry the number of the run that processed them.
+    batch_id: u64,
+    /// The user agreed to close the window while a run is going.
+    close_confirmed: bool,
 }
 
 impl App {
@@ -333,8 +396,15 @@ impl App {
         theme::install(&cc.egui_ctx);
         let settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let ffmpeg_ok = which("ffmpeg") && which("ffprobe");
+        let mut app = App::from_parts(cc.egui_ctx.clone(), settings, ffmpeg_ok);
+        app.queue_args(&args);
+        app
+    }
+
+    /// The app with an empty list (also what the tests start from).
+    fn from_parts(ctx: egui::Context, settings: Settings, ffmpeg_ok: bool) -> Self {
         let (probe_tx, probe_rx) = channel();
-        let mut app = App {
+        App {
             settings,
             jobs: Vec::new(),
             worker: None,
@@ -348,7 +418,7 @@ impl App {
             error: None,
             ffmpeg_ok,
             dialog: Dialog::None,
-            ctx: cc.egui_ctx.clone(),
+            ctx,
             probe_tx,
             probe_rx,
             mode_touched: false,
@@ -358,21 +428,27 @@ impl App {
             worker_idle_since: None,
             adv_open: false,
             log_open: false,
-        };
-        // Files given on the command line (dropped on the .exe / shortcut, or "Open with") join the queue.
-        // --start begins processing immediately; --mic-track N --game-track N switch to mic-track mode.
+            next_id: 1,
+            batch_id: 0,
+            close_confirmed: false,
+        }
+    }
+
+    /// Files given on the command line (dropped on the .exe / shortcut, or "Open with") join the queue.
+    /// --start begins processing immediately; --mic-track N --game-track N switch to mic-track mode.
+    fn queue_args(&mut self, args: &[String]) {
         let mut files = Vec::new();
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--mic-track" | "--game-track" => {
                     if let Some(n) = it.next().and_then(|v| v.parse::<u32>().ok()).filter(|n| *n >= 1) {
-                        app.settings.multitrack = true;
-                        app.mode_touched = true;
+                        self.settings.multitrack = true;
+                        self.mode_touched = true;
                         if a == "--mic-track" {
-                            app.settings.mic_track = n;
+                            self.settings.mic_track = n;
                         } else {
-                            app.settings.game_track = n;
+                            self.settings.game_track = n;
                         }
                     }
                 }
@@ -380,15 +456,14 @@ impl App {
                 s => files.push(PathBuf::from(s)),
             }
         }
-        app.add_paths(files);
+        self.add_paths(files);
         // --sample makes a before/after sample of the first file (used for testing).
-        if args.iter().any(|a| a == "--sample") && !app.jobs.is_empty() {
-            app.request_sample(0);
+        if args.iter().any(|a| a == "--sample") && !self.jobs.is_empty() {
+            self.request_sample(0);
         }
-        if args.iter().any(|a| a == "--start") && !app.jobs.is_empty() {
-            app.start();
+        if args.iter().any(|a| a == "--start") && !self.jobs.is_empty() {
+            self.start();
         }
-        app
     }
 
     fn running(&self) -> bool {
@@ -404,6 +479,8 @@ impl App {
 
     fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for p in paths {
+            // The worker runs in the engine's folder, so a relative path would mean a different file there.
+            let p = std::path::absolute(&p).unwrap_or(p);
             if p.is_dir() {
                 if let Ok(rd) = std::fs::read_dir(&p) {
                     let mut inner: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
@@ -417,9 +494,9 @@ impl App {
             if !(is_video || AUDIO_EXT.contains(&ext.as_str())) {
                 continue;
             }
-            let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            if name.ends_with("(no music)") || [" - speech", " - sfx", " - music", " - mic", " - game (no music)"].iter().any(|s| name.ends_with(s)) {
-                continue; // our own outputs
+            let name = stem_of(&p);
+            if name.ends_with("(no music)") || name.ends_with(".partial") || [" - speech", " - sfx", " - music", " - mic", " - game (no music)"].iter().any(|s| name.ends_with(s)) {
+                continue; // our own outputs (finished or still being written)
             }
             if !self.jobs.iter().any(|j| j.path == p) {
                 let (tx, ctx, probe_path) = (self.probe_tx.clone(), self.ctx.clone(), p.clone());
@@ -428,10 +505,55 @@ impl App {
                     let _ = tx.send((probe_path, result));
                     ctx.request_repaint();
                 });
-                self.jobs.push(Job { path: p, is_video, status: Status::Waiting, probe: None, note: None, opts: None, sample: Sample::None });
+                self.push_job(p, is_video);
                 self.summary = None;
             }
         }
+    }
+
+    fn push_job(&mut self, path: PathBuf, is_video: bool) {
+        self.jobs.push(Job { id: self.next_id, batch: 0, path, is_video, status: Status::Waiting, probe: None, note: None, opts: None, sample: Sample::None });
+        self.next_id += 1;
+    }
+
+    /// Folder a file's results are saved to.
+    fn out_dir_for(&self, job: &Job) -> PathBuf {
+        let custom = self.settings.custom_folder.trim();
+        if self.settings.use_custom_folder && !custom.is_empty() { PathBuf::from(custom) } else { job.path.parent().map(Path::to_path_buf).unwrap_or_default() }
+    }
+
+    /// Name a file's results are based on: the recording's own name, with " (2)", " (3)"... added
+    /// when a file earlier in the list would otherwise be saved under the same names
+    /// (stream.mp4 and stream.wav in one folder, or same-named files going to one output folder).
+    fn out_base(&self, job: &Job) -> String {
+        let key = |j: &Job| (self.out_dir_for(j).to_string_lossy().to_lowercase(), stem_of(&j.path).to_lowercase());
+        let mine = key(job);
+        let earlier = self.jobs.iter().filter(|j| j.id < job.id && key(j) == mine).count();
+        let stem = stem_of(&job.path);
+        if earlier == 0 { stem } else { format!("{stem} ({})", earlier + 1) }
+    }
+
+    /// The files a waiting file will produce with the current settings.
+    fn planned_outputs(&self, job: &Job) -> Vec<PathBuf> {
+        let s = &self.settings;
+        let (dir, base) = (self.out_dir_for(job), self.out_base(job));
+        let mut files = Vec::new();
+        if s.out_video && job.is_video {
+            files.push(dir.join(format!("{base} (no music).{}", video_out_ext(&job.path))));
+        }
+        if s.out_clean || (s.out_video && !job.is_video && !s.out_stems) {
+            files.push(dir.join(format!("{base} (no music).wav")));
+        }
+        if s.out_stems {
+            let parts: &[&str] = if s.multitrack && !self.needs_fallback(job) { &["mic", "game (no music)", "music"] } else { &["speech", "sfx", "music"] };
+            files.extend(parts.iter().map(|part| dir.join(format!("{base} - {part}.wav"))));
+        }
+        files
+    }
+
+    /// How many files from an earlier run the waiting files will replace.
+    fn replaced_count(&self) -> usize {
+        self.jobs.iter().filter(|j| matches!(j.status, Status::Waiting)).flat_map(|j| self.planned_outputs(j)).filter(|f| f.exists()).count()
     }
 
     fn waiting_count(&self) -> usize {
@@ -468,6 +590,9 @@ impl App {
     }
 
     fn start(&mut self) {
+        if self.batch_active {
+            return; // a file set to waiting again simply joins the run that is already going
+        }
         self.error = None;
         if let Err(e) = self.validate() {
             self.error = Some(e);
@@ -478,6 +603,7 @@ impl App {
         }
         self.summary = None;
         self.batch_active = true;
+        self.batch_id += 1;
         self.batch_started = Instant::now();
         keep_awake(true);
         for j in &mut self.jobs {
@@ -513,8 +639,13 @@ impl App {
     }
 
     fn stop(&mut self) {
+        let leftovers = self.running_partials();
         if let Some(w) = self.worker.take() {
-            w.kill();
+            // Off the UI thread: the files can only be deleted once the worker has let go of them.
+            std::thread::spawn(move || {
+                w.kill();
+                remove_partials(leftovers, &w.child);
+            });
         }
         for j in &mut self.jobs {
             if matches!(j.status, Status::Running { .. }) {
@@ -522,7 +653,12 @@ impl App {
             }
         }
         self.finish_batch(true);
-        self.log("Stopped by user");
+        self.log("Stopped");
+    }
+
+    /// Temporary files of the file(s) being processed right now.
+    fn running_partials(&self) -> Vec<PathBuf> {
+        self.jobs.iter().filter(|j| matches!(j.status, Status::Running { .. })).filter_map(|j| j.opts.as_ref()).flat_map(partial_files).collect()
     }
 
     fn finish_batch(&mut self, stopped: bool) {
@@ -532,8 +668,9 @@ impl App {
         self.batch_active = false;
         keep_awake(false);
         self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
-        let done = self.jobs.iter().filter(|j| matches!(j.status, Status::Done { .. })).count();
-        let failed = self.jobs.iter().filter(|j| matches!(j.status, Status::Failed(_))).count();
+        let batch = self.batch_id;
+        let done = self.jobs.iter().filter(|j| j.batch == batch && matches!(j.status, Status::Done { .. })).count();
+        let failed = self.jobs.iter().filter(|j| j.batch == batch && matches!(j.status, Status::Failed(_))).count();
         self.summary = Some(Summary { done, failed, stopped, seconds: self.batch_started.elapsed().as_secs_f64() });
     }
 
@@ -579,7 +716,7 @@ impl App {
                 let s = &self.settings;
                 let dir = std::env::temp_dir().join("Stream Music Remover samples");
                 let job = serde_json::json!({
-                    "index": i,
+                    "index": self.jobs[i].id,
                     "path": self.jobs[i].path.to_string_lossy(),
                     "sample": true,
                     "sample_seconds": 30,
@@ -596,7 +733,7 @@ impl App {
                 } else {
                     self.jobs[i].sample = Sample::Failed("Lost contact with the processing engine.".into());
                 }
-            } else if self.worker_idle_since.is_some_and(|t| t.elapsed() > Duration::from_secs(120)) {
+            } else if self.worker_idle_since.is_some_and(|t| t.elapsed() > ENGINE_IDLE_LIMIT) {
                 // Nothing to do for a while: close the engine so the graphics card memory is freed.
                 if let Some(mut w) = self.worker.take() {
                     drop(w.stdin.take());
@@ -622,11 +759,18 @@ impl App {
             return;
         };
         let s = &self.settings;
-        let opts = JobOptions { multitrack: s.multitrack, mic_track: s.mic_track, game_track: s.game_track };
+        let opts = JobOptions {
+            multitrack: s.multitrack,
+            mic_track: s.mic_track,
+            game_track: s.game_track,
+            out_dir: self.out_dir_for(&self.jobs[i]),
+            base: self.out_base(&self.jobs[i]),
+        };
         let job = serde_json::json!({
-            "index": i,
+            "index": self.jobs[i].id,
             "path": self.jobs[i].path.to_string_lossy(),
-            "outdir": if s.use_custom_folder { s.custom_folder.trim().to_string() } else { String::new() },
+            "outdir": opts.out_dir.to_string_lossy(),
+            "name": opts.base,
             "clean": s.out_clean,
             "video": s.out_video,
             "stems": s.out_stems,
@@ -640,6 +784,7 @@ impl App {
         if sent {
             w.idle = false;
             self.jobs[i].opts = Some(opts);
+            self.jobs[i].batch = self.batch_id;
             self.jobs[i].note = None;
             self.jobs[i].status = Status::Running { progress: 0.0, stage: "Starting".into(), started: Instant::now() };
         } else {
@@ -676,7 +821,13 @@ impl App {
         }
         if let Some(code) = exited {
             let unexpected = self.batch_active;
-            self.worker = None;
+            let leftovers = self.running_partials();
+            if let Some(w) = self.worker.take()
+                && !leftovers.is_empty()
+            {
+                // It died mid-file, so it never got to tidy up after itself.
+                std::thread::spawn(move || remove_partials(leftovers, &w.child));
+            }
             self.sample_in_flight = None;
             for j in &mut self.jobs {
                 if matches!(j.sample, Sample::Pending | Sample::Working) {
@@ -703,7 +854,8 @@ impl App {
 
     fn handle_event(&mut self, v: &serde_json::Value) {
         let event = v["event"].as_str().unwrap_or("");
-        let job = v["index"].as_u64().map(|i| i as usize).filter(|i| *i < self.jobs.len());
+        // "index" carries the file's id, not its row: rows move when the list is edited during a run.
+        let job = v["index"].as_u64().and_then(|id| self.jobs.iter().position(|j| j.id == id));
         let message = v["message"].as_str().unwrap_or("").to_string();
         match (event, job) {
             ("log", _) => self.log(message),
@@ -855,18 +1007,21 @@ impl App {
         for j in self.jobs.iter().filter(|j| matches!(j.status, Status::Waiting)) {
             let Some(d) = j.duration() else { continue };
             let wav = d * 48_000.0 * 2.0 * 3.0;
+            let video = s.out_video && j.is_video;
             let mut bytes = 0.0;
-            if s.out_video && j.is_video {
+            if video {
                 bytes += std::fs::metadata(&j.path).map(|m| m.len() as f64).unwrap_or(d * 750_000.0);
             }
-            if s.out_clean || (s.out_video && !j.is_video && !s.out_stems) {
+            // The mixed WAV is needed to build the video even when it isn't kept.
+            if video || s.out_clean || (s.out_video && !j.is_video && !s.out_stems) {
                 bytes += wav;
             }
             if s.out_stems {
                 bytes += 3.0 * wav;
+            } else if video && s.multitrack && s.video_tracks && !self.needs_fallback(j) {
+                bytes += 2.0 * wav; // temporary mic and game WAVs for the extra video tracks
             }
-            let dir = if s.use_custom_folder && !s.custom_folder.trim().is_empty() { PathBuf::from(s.custom_folder.trim()) } else { j.path.clone() };
-            let drive = drive_of(&dir);
+            let drive = drive_of(&self.out_dir_for(j));
             match need.iter_mut().find(|(k, _)| *k == drive) {
                 Some(e) => e.1 += bytes as u64,
                 None => need.push((drive, bytes as u64)),
@@ -902,7 +1057,7 @@ impl App {
 
     /// (files finished in this batch, total files in this batch, seconds left if known)
     fn batch_progress(&self) -> (usize, usize, f32, Option<f64>) {
-        let in_batch: Vec<&Job> = self.jobs.iter().filter(|j| !matches!(j.status, Status::Done { .. } | Status::Failed(_) | Status::Stopped) || j.opts.is_some()).collect();
+        let in_batch: Vec<&Job> = self.jobs.iter().filter(|j| !matches!(j.status, Status::Done { .. } | Status::Failed(_) | Status::Stopped) || j.batch == self.batch_id).collect();
         let total = in_batch.len();
         let finished = in_batch.iter().filter(|j| matches!(j.status, Status::Done { .. } | Status::Failed(_) | Status::Stopped)).count();
         // Weight by duration when known.
@@ -1066,6 +1221,8 @@ impl App {
         let mut action = RowAction::None;
         let running = self.running();
         let fallback = self.needs_fallback(&self.jobs[i]);
+        // Set when the results get a different name because another file in the list has the same one.
+        let renamed = Some(self.out_base(&self.jobs[i])).filter(|base| *base != stem_of(&self.jobs[i].path));
         let job = &self.jobs[i];
         let failed = matches!(job.status, Status::Failed(_));
         let active = matches!(job.status, Status::Running { .. });
@@ -1137,10 +1294,10 @@ impl App {
                             });
                         }
                         Status::Done { outputs, seconds } => {
-                            if secondary_button(ui, Some(ICON_FOLDER), "Show", true).on_hover_text(outputs.join("\n")).clicked() {
-                                if let Some(first) = outputs.first() {
-                                    reveal(first);
-                                }
+                            if secondary_button(ui, Some(ICON_FOLDER), "Show", true).on_hover_text(outputs.join("\n")).clicked()
+                                && let Some(first) = outputs.first()
+                            {
+                                reveal(first);
                             }
                             ui.label(RichText::new(format!("Done in {}", fmt_secs(*seconds))).size(13.5).color(GOOD));
                             ui.label(icon(ICON_CHECK, 15.0, GOOD));
@@ -1176,7 +1333,8 @@ impl App {
             if let Status::Failed(msg) = &job.status {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(indent);
-                    ui.label(RichText::new(friendly_error(msg, job.opts.as_ref(), &drive_of(&job.path))).size(13.5).color(BAD_TEXT));
+                    let saved_to = job.opts.as_ref().map(|o| o.out_dir.as_path()).unwrap_or(&job.path);
+                    ui.label(RichText::new(friendly_error(msg, job.opts.as_ref(), &drive_of(saved_to))).size(13.5).color(BAD_TEXT));
                 });
             } else if let Some(note) = &job.note {
                 ui.horizontal_wrapped(|ui| {
@@ -1189,11 +1347,21 @@ impl App {
                     ui.add_space(indent);
                     ui.label(RichText::new(format!("The sample couldn't be made: {e}")).size(13.5).color(BAD_TEXT));
                 });
-            } else if fallback && matches!(job.status, Status::Waiting) {
+            } else if let (Some(base), Status::Waiting) = (&renamed, &job.status) {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(indent);
                     ui.label(icon(ICON_INFO, 13.0, MUTED));
-                    ui.label(RichText::new("One audio track, so it's processed as a mixed track. That's fine.").size(13.5).color(MUTED));
+                    ui.label(RichText::new(format!("Another file in the list has the same name, so this one's results are saved as \"{base}\".")).size(13.5).color(MUTED));
+                });
+            } else if fallback && matches!(job.status, Status::Waiting) {
+                let text = match job.track_count() {
+                    Some(n) if n > 1 => format!("Only {n} audio tracks, so it's processed as one mixed track. That's fine."),
+                    _ => "One audio track, so it's processed as a mixed track. That's fine.".to_string(),
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(indent);
+                    ui.label(icon(ICON_INFO, 13.0, MUTED));
+                    ui.label(RichText::new(text).size(13.5).color(MUTED));
                 });
             } else if let Some(Err(e)) = &job.probe {
                 ui.horizontal_wrapped(|ui| {
@@ -1261,6 +1429,7 @@ impl App {
         let running = self.running();
         let multi = self.settings.multitrack;
         let scroll = std::mem::take(&mut self.scroll_to_output);
+        let replaced = if running { 0 } else { self.replaced_count() };
         let r = ui.scope(|ui| card(ui, |ui| {
             section_header(ui, "Output", running);
             ui.add_space(6.0);
@@ -1305,10 +1474,10 @@ impl App {
                         let shown = if self.settings.custom_folder.trim().is_empty() { "No folder chosen yet".to_string() } else { middle_truncate(&self.settings.custom_folder, 60) };
                         ui.label(icon(ICON_FOLDER, 14.0, MUTED));
                         ui.label(RichText::new(shown).size(13.5).color(if self.settings.custom_folder.trim().is_empty() { WARN } else { TEXT })).on_hover_text(&self.settings.custom_folder);
-                        if secondary_button(ui, None, "Choose...", true).clicked() {
-                            if let Some(dir) = rfd::FileDialog::new().set_title("Save files to").pick_folder() {
-                                self.settings.custom_folder = dir.to_string_lossy().into_owned();
-                            }
+                        if secondary_button(ui, None, "Choose...", true).clicked()
+                            && let Some(dir) = rfd::FileDialog::new().set_title("Save files to").pick_folder()
+                        {
+                            self.settings.custom_folder = dir.to_string_lossy().into_owned();
                         }
                     });
                 }
@@ -1350,6 +1519,14 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.label(RichText::new("Your original recordings are never changed.").size(13.5).color(MUTED));
+                    if replaced > 0 {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(icon(ICON_INFO, 13.0, WARN));
+                            let text = if replaced == 1 { "1 file made in an earlier run will be replaced.".to_string() } else { format!("{replaced} files made in an earlier run will be replaced.") };
+                            ui.label(RichText::new(text).size(13.5).color(WARN));
+                        });
+                    }
                 });
             });
         })).response;
@@ -1361,18 +1538,13 @@ impl App {
     fn preview_names(&self) -> Vec<String> {
         let sample = self.jobs.first();
         let (base, ext, is_video) = match sample {
-            Some(j) => (
-                j.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                j.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default(),
-                j.is_video,
-            ),
+            Some(j) => (self.out_base(j), video_out_ext(&j.path), j.is_video),
             None => ("Recording".into(), "mp4".into(), true),
         };
         let base = middle_truncate(&base, 54);
         let s = &self.settings;
         let mut v = Vec::new();
         if s.out_video && is_video {
-            let ext = if ["mp4", "mkv", "mov", "m4v", "webm"].contains(&ext.as_str()) { ext } else { "mkv".into() };
             v.push(format!("{base} (no music).{ext}"));
         }
         if s.out_clean || (s.out_video && !is_video && !s.out_stems) {
@@ -1492,10 +1664,10 @@ impl App {
                     if big_primary_button(ui, &label, true).clicked() {
                         self.retry_failed();
                     }
-                    if let Some(folder) = self.output_folder() {
-                        if secondary_button(ui, Some(ICON_FOLDER), "Open output folder", true).clicked() {
-                            reveal(&folder);
-                        }
+                    if let Some(folder) = self.output_folder()
+                        && secondary_button(ui, Some(ICON_FOLDER), "Open output folder", true).clicked()
+                    {
+                        reveal(&folder);
                     }
                 } else if self.summary.is_some() && self.output_folder().is_some() {
                     if big_primary_button(ui, "Open output folder", true).clicked() {
@@ -1529,6 +1701,38 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if danger_button(ui, "Stop").clicked() {
                                 self.stop();
+                                close = true;
+                            }
+                            if secondary_button(ui, None, "Keep going", true).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                });
+                if close || modal.should_close() {
+                    self.dialog = Dialog::None;
+                }
+            }
+            Dialog::ConfirmClose => {
+                let mut close = false;
+                let modal = egui::Modal::new(egui::Id::unique("confirm_close")).frame(dialog_frame()).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(RichText::new("Close while processing?").font(semibold(18.0)).color(TEXT));
+                    ui.add_space(6.0);
+                    let waiting = self.waiting_count();
+                    let mut text = "Processing stops and the file being worked on now will have to start over.".to_string();
+                    if waiting > 0 {
+                        text.push_str(&format!(" {waiting} waiting file{} won't be processed.", plural(waiting)));
+                    }
+                    ui.label(RichText::new(text).size(14.0).color(TEXT));
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("Files that are already done are kept.").size(14.0).color(MUTED));
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if danger_button(ui, "Close").clicked() {
+                                self.close_confirmed = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 close = true;
                             }
                             if secondary_button(ui, None, "Keep going", true).clicked() {
@@ -1619,9 +1823,9 @@ impl App {
                 path_row(ui, "Worker script", &mut self.settings.worker, false);
                 path_row(ui, "Model file", &mut self.settings.model, false);
                 path_row(ui, "Model settings", &mut self.settings.config, false);
-                if link_button(ui, "Reset to defaults").clicked() {
-                    let keep = self.settings.clone();
-                    self.settings = Settings { multitrack: keep.multitrack, mic_track: keep.mic_track, game_track: keep.game_track, learned_speed: keep.learned_speed, ..Settings::default() };
+                if link_button(ui, "Reset to defaults").on_hover_text("Resets these five locations. Your other choices stay as they are.").clicked() {
+                    let d = Settings::default();
+                    self.settings = Settings { msst_dir: d.msst_dir, python: d.python, worker: d.worker, model: d.model, config: d.config, ..self.settings.clone() };
                 }
                 ui.add_space(4.0);
             }
@@ -1658,6 +1862,12 @@ impl eframe::App for App {
         self.poll_worker();
         self.dispatch();
 
+        // Closing the window mid-run throws away the file in progress, so ask first.
+        if self.running() && !self.close_confirmed && ui.ctx().input(|i| i.viewport().close_requested()) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Dialog::ConfirmClose;
+        }
+
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
             self.add_paths(dropped);
@@ -1687,6 +1897,9 @@ impl eframe::App for App {
 
         if self.running() {
             ui.ctx().request_repaint_after(Duration::from_millis(500)); // keep times ticking
+        } else if let (Some(_), Some(idle)) = (&self.worker, self.worker_idle_since) {
+            // Wake up when the idle engine is due to be closed, even if nobody touches the window.
+            ui.ctx().request_repaint_after(ENGINE_IDLE_LIMIT.saturating_sub(idle.elapsed()) + Duration::from_millis(250));
         }
     }
 
@@ -1695,8 +1908,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        let leftovers = self.running_partials();
         if let Some(w) = self.worker.take() {
             w.kill();
+            remove_partials(leftovers, &w.child);
         }
     }
 }
@@ -1846,6 +2061,17 @@ fn free_space(dir: &str) -> Option<u64> {
 fn fmt_bytes(b: u64) -> String {
     let gb = b as f64 / 1e9;
     if gb >= 10.0 { format!("{:.0} GB", gb) } else if gb >= 1.0 { format!("{:.1} GB", gb) } else { format!("{:.0} MB", (b as f64 / 1e6).max(1.0)) }
+}
+
+/// File name without its extension.
+fn stem_of(p: &Path) -> String {
+    p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Extension a recording's video result is written with (matches the worker).
+fn video_out_ext(p: &Path) -> String {
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if VIDEO_OUT_EXT.contains(&ext.as_str()) { ext } else { "mkv".into() }
 }
 
 fn file_name(p: &Path) -> String {
