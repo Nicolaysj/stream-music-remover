@@ -8,6 +8,8 @@
 mod logic_tests;
 #[cfg(test)]
 mod screens;
+mod setup;
+mod setup_ui;
 mod theme;
 
 use eframe::egui::{self, RichText};
@@ -17,9 +19,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use setup_ui::SetupUi;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use theme::*;
+
+/// Folder with the engine's own ffmpeg.exe and ffprobe.exe, once setup has installed them.
+/// Without it, the ones on the PATH are used.
+static FFMPEG_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// What to run for "ffmpeg" or "ffprobe".
+fn tool(name: &str) -> PathBuf {
+    match FFMPEG_DIR.read().unwrap().as_ref().map(|dir| dir.join(format!("{name}.exe"))) {
+        Some(path) if path.exists() => path,
+        _ => PathBuf::from(name),
+    }
+}
 
 const VIDEO_EXT: &[&str] = &["mp4", "mkv", "mov", "m4v", "flv", "ts", "webm", "avi"];
 const AUDIO_EXT: &[&str] = &["wav", "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma"];
@@ -29,6 +44,10 @@ const VIDEO_OUT_EXT: &[&str] = &["mp4", "mkv", "mov", "m4v", "webm"];
 const ENGINE_IDLE_LIMIT: Duration = Duration::from_secs(120);
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--run-setup") {
+        std::process::exit(run_setup_without_window(&args[i + 1..]));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Stream Music Remover")
@@ -38,6 +57,45 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Stream Music Remover", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// `--run-setup [folder] [--backend cpu|cu118|cu126|cu128]`: install the engine without opening a
+/// window, for scripted installs and for testing. Prints what the setup screen would show.
+fn run_setup_without_window(args: &[String]) -> i32 {
+    let mut root = setup::Engine::default_root();
+    let mut backend = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--backend" => backend = it.next().and_then(|name| setup::Backend::from_name(name)),
+            other if !other.starts_with("--") => root = std::path::absolute(other).unwrap_or_else(|_| PathBuf::from(other)),
+            _ => {}
+        }
+    }
+    let gpu = setup::detect_gpu();
+    let backend = backend.unwrap_or_else(|| gpu.backend());
+    println!("Graphics card: {} (driver {:?})", gpu.name.as_deref().unwrap_or("none found"), gpu.driver);
+    let handle = setup::start(setup::Engine::new(root), backend, || {});
+    let mut shown = Instant::now();
+    for msg in &handle.rx {
+        match msg {
+            setup::Msg::Log(line) => println!("{line}"),
+            setup::Msg::Progress { id, done, total } if shown.elapsed() > Duration::from_secs(5) => {
+                shown = Instant::now();
+                println!("    {id}: {} of {}", fmt_bytes(done), fmt_bytes(total));
+            }
+            setup::Msg::Failed(e) => {
+                println!("FAILED: {e}");
+                return 1;
+            }
+            setup::Msg::Finished { device, gpu } => {
+                println!("READY: {device} (graphics card used: {gpu})");
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    1
 }
 
 // ---------- settings ----------
@@ -62,6 +120,9 @@ struct Settings {
     video_tracks: bool,
     /// Seconds of media processed per second, remembered from earlier runs (0 = unknown).
     learned_speed: f64,
+    /// Folder of the engine installed by the setup screen. Empty when the engine was set up by
+    /// hand, in which case the five locations above are whatever the user entered.
+    engine_root: String,
 }
 
 impl Default for Settings {
@@ -95,6 +156,7 @@ impl Default for Settings {
             game_track: 3,
             video_tracks: true,
             learned_speed: 0.0,
+            engine_root: String::new(),
         }
     }
 }
@@ -216,7 +278,7 @@ impl Job {
 }
 
 fn probe_file(path: &Path) -> Result<Probe, String> {
-    let mut cmd = Command::new("ffprobe");
+    let mut cmd = Command::new(tool("ffprobe"));
     cmd.args(["-v", "error", "-show_entries", "format=duration:stream=codec_type:stream_tags=title,handler_name", "-of", "json"])
         .arg(path)
         .stdin(Stdio::null());
@@ -260,23 +322,28 @@ impl Worker {
     /// End the worker and anything it started. ffmpeg runs as a child of the worker, and would
     /// otherwise carry on writing in the background.
     fn kill(&self) {
-        let mut guard = self.child.lock().unwrap();
-        let Some(child) = guard.as_mut() else { return };
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return; // already gone
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            kill_tree(child);
         }
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("taskkill");
-            cmd.args(["/PID", &child.id().to_string(), "/T", "/F"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            no_window(&mut cmd);
-            let _ = cmd.status();
-        }
-        let _ = child.kill();
     }
 }
 
-fn no_window(cmd: &mut Command) {
+/// End a process and everything it started.
+pub(crate) fn kill_tree(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return; // already gone
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &child.id().to_string(), "/T", "/F"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        no_window(&mut cmd);
+        let _ = cmd.status();
+    }
+    let _ = child.kill();
+}
+
+pub(crate) fn no_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -284,6 +351,13 @@ fn no_window(cmd: &mut Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+/// The PATH for the worker: the engine's own ffmpeg folder first, so the worker finds it by name.
+fn path_with_tools() -> std::ffi::OsString {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let Some(dir) = FFMPEG_DIR.read().unwrap().clone() else { return current };
+    std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&current))).unwrap_or(current)
 }
 
 fn spawn_worker(settings: &Settings, ctx: egui::Context) -> Result<Worker, String> {
@@ -295,6 +369,7 @@ fn spawn_worker(settings: &Settings, ctx: egui::Context) -> Result<Worker, Strin
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1")
+        .env("PATH", path_with_tools())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -385,6 +460,8 @@ struct App {
     batch_id: u64,
     /// The user agreed to close the window while a run is going.
     close_confirmed: bool,
+    /// The setup screen, shown instead of the main window while it is open.
+    setup: Option<SetupUi>,
 }
 
 impl App {
@@ -395,8 +472,9 @@ impl App {
     fn with_args(cc: &eframe::CreationContext<'_>, args: Vec<String>) -> Self {
         theme::install(&cc.egui_ctx);
         let settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
-        let ffmpeg_ok = which("ffmpeg") && which("ffprobe");
-        let mut app = App::from_parts(cc.egui_ctx.clone(), settings, ffmpeg_ok);
+        let mut app = App::from_parts(cc.egui_ctx.clone(), settings, false);
+        // --setup opens the setup screen even when the app already works.
+        app.choose_engine(args.iter().any(|a| a == "--setup"));
         app.queue_args(&args);
         app
     }
@@ -431,6 +509,7 @@ impl App {
             next_id: 1,
             batch_id: 0,
             close_confirmed: false,
+            setup: None,
         }
     }
 
@@ -457,6 +536,9 @@ impl App {
             }
         }
         self.add_paths(files);
+        if self.setup.is_some() {
+            return; // nothing can run before the engine is installed; the files wait in the list
+        }
         // --sample makes a before/after sample of the first file (used for testing).
         if args.iter().any(|a| a == "--sample") && !self.jobs.is_empty() {
             self.request_sample(0);
@@ -1776,6 +1858,7 @@ impl App {
 
     fn settings_body(&mut self, ui: &mut egui::Ui) {
         let running = self.running();
+        let mut open_setup = false;
         // Engine status
         let problem = self.settings.engine_problem().or_else(|| (!self.ffmpeg_ok).then(|| "ffmpeg isn't installed (winget install Gyan.FFmpeg).".to_string()));
         egui::Frame::new().fill(SURFACE_2).corner_radius(8.0).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
@@ -1791,6 +1874,9 @@ impl App {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Something the app needs is missing").font(semibold(14.5)).color(BAD));
                         ui.label(RichText::new(p).size(13.5).color(BAD_TEXT));
+                        if !running && link_button(ui, "Run setup to fix it").clicked() {
+                            open_setup = true;
+                        }
                     });
                 }
             });
@@ -1823,10 +1909,15 @@ impl App {
                 path_row(ui, "Worker script", &mut self.settings.worker, false);
                 path_row(ui, "Model file", &mut self.settings.model, false);
                 path_row(ui, "Model settings", &mut self.settings.config, false);
-                if link_button(ui, "Reset to defaults").on_hover_text("Resets these five locations. Your other choices stay as they are.").clicked() {
-                    let d = Settings::default();
-                    self.settings = Settings { msst_dir: d.msst_dir, python: d.python, worker: d.worker, model: d.model, config: d.config, ..self.settings.clone() };
-                }
+                ui.horizontal(|ui| {
+                    if link_button(ui, "Reset to defaults").on_hover_text("Resets these five locations. Your other choices stay as they are.").clicked() {
+                        let d = Settings::default();
+                        self.settings = Settings { msst_dir: d.msst_dir, python: d.python, worker: d.worker, model: d.model, config: d.config, engine_root: String::new(), ..self.settings.clone() };
+                    }
+                    if link_button(ui, "Run setup again").on_hover_text("Downloads and installs the audio engine again, or repairs it").clicked() {
+                        open_setup = true;
+                    }
+                });
                 ui.add_space(4.0);
             }
         });
@@ -1844,6 +1935,9 @@ impl App {
                 });
             });
         }
+        if open_setup {
+            self.open_setup(true);
+        }
     }
 }
 
@@ -1857,6 +1951,18 @@ enum RowAction {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.setup.is_some() {
+            // Until the engine is installed there is nothing else to show. Files dropped on the
+            // window meanwhile still join the list, ready for when setup is done.
+            let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+            if !dropped.is_empty() {
+                self.add_paths(dropped);
+            }
+            self.poll_probes();
+            self.poll_setup();
+            self.draw_setup(ui);
+            return;
+        }
         self.poll_probes();
         self.auto_detect();
         self.poll_worker();
@@ -1908,6 +2014,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.cancel_setup(); // what is already downloaded stays, so it carries on next time
         let leftovers = self.running_partials();
         if let Some(w) = self.worker.take() {
             w.kill();
@@ -2144,7 +2251,7 @@ fn reveal(path: &str) {
 }
 
 fn which(program: &str) -> bool {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(tool(program));
     cmd.arg("-version").stdout(Stdio::null()).stderr(Stdio::null());
     no_window(&mut cmd);
     cmd.status().map(|s| s.success()).unwrap_or(false)

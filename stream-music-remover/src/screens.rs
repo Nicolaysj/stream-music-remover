@@ -74,6 +74,7 @@ fn render(name: &str, size: [f32; 2], setup: impl FnOnce(&mut App)) {
         let mut app = App::with_args(cc, vec![]);
         app.settings = Settings { learned_speed: 10.5, ..Settings::default() };
         app.ffmpeg_ok = true;
+        app.setup = None; // the same screens whether or not this PC has the engine installed
         setup(&mut app);
         app
     });
@@ -136,6 +137,37 @@ fn render_screens() {
         app.settings.mic_track = 2;
         app.settings.game_track = 3;
         app.mode_touched = true;
+    });
+    let setup_screen = |gpu: Option<(&str, f64)>| {
+        let gpu = setup::Gpu { name: gpu.map(|g| g.0.to_string()), driver: gpu.map(|g| g.1) };
+        SetupUi::new(PathBuf::from(r"C:\Users\Sam\AppData\Local\StreamMusicRemover\engine"), gpu, false)
+    };
+    let rtx = Some(("NVIDIA GeForce RTX 4070", 581.29));
+    render("12_setup_intro", WINDOW, |app| app.setup = Some(setup_screen(rtx)));
+    render("13_setup_intro_no_graphics_card", WINDOW, |app| app.setup = Some(setup_screen(None)));
+    render("14_setup_running", WINDOW, |app| {
+        let mut s = setup_screen(rtx);
+        s.phase = setup_ui::SetupPhase::Running;
+        s.apply(setup::Msg::Step { id: "tools".into(), done: true });
+        s.apply(setup::Msg::Step { id: "packages".into(), done: false });
+        s.apply(setup::Msg::Progress { id: "packages".into(), done: 2_300_000_000, total: 6_000_000_000 });
+        app.setup = Some(s);
+    });
+    render("15_setup_failed", WINDOW, |app| {
+        let mut s = setup_screen(rtx);
+        s.apply(setup::Msg::Step { id: "tools".into(), done: true });
+        s.apply(setup::Msg::Step { id: "packages".into(), done: true });
+        s.apply(setup::Msg::Step { id: "ffmpeg".into(), done: true });
+        s.apply(setup::Msg::Step { id: "model".into(), done: false });
+        s.apply(setup::Msg::Log("urllib.error.URLError: <urlopen error [Errno 11001] getaddrinfo failed>".into()));
+        s.apply(setup::Msg::Failed("The download kept getting interrupted. Check your internet connection and try again.".into()));
+        s.show_log = true;
+        app.setup = Some(s);
+    });
+    render("16_setup_done", WINDOW, |app| {
+        let mut s = setup_screen(rtx);
+        s.apply(setup::Msg::Finished { device: "NVIDIA GeForce RTX 4070".into(), gpu: true });
+        app.setup = Some(s);
     });
     render("09_listening_to_samples", WINDOW, |app| {
         app.jobs = queue();

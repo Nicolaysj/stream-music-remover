@@ -211,6 +211,103 @@ fn mic_track_layout_is_detected_from_track_names() {
 }
 
 #[test]
+fn the_pytorch_build_follows_the_graphics_card_and_its_driver() {
+    use setup::{Backend, parse_gpu};
+    let gpu = parse_gpu("NVIDIA GeForce RTX 4090, 616.92\r\n");
+    assert_eq!(gpu.name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+    assert_eq!(gpu.backend(), Backend::Cu128);
+    assert_eq!(parse_gpu("NVIDIA GeForce GTX 1070, 566.36").backend(), Backend::Cu126);
+    assert_eq!(parse_gpu("NVIDIA GeForce GTX 970, 537.58").backend(), Backend::Cu118);
+    // Two cards: the first one decides.
+    assert_eq!(parse_gpu("NVIDIA GeForce RTX 5080, 581.29\nNVIDIA GeForce GTX 1050, 581.29\n").backend(), Backend::Cu128);
+
+    // A card whose driver is too old for any build falls back to the processor, and says why.
+    let old = parse_gpu("NVIDIA GeForce GTX 780, 391.35");
+    assert_eq!(old.backend(), Backend::Cpu);
+    assert!(old.driver_too_old());
+
+    // No NVIDIA card (nvidia-smi missing or printing nothing).
+    let none = parse_gpu("");
+    assert_eq!((none.backend(), none.driver_too_old()), (Backend::Cpu, false));
+    assert_eq!(Backend::from_name("cu126"), Some(Backend::Cu126));
+    assert_eq!(Backend::from_name("cuda"), None);
+}
+
+#[test]
+fn an_engine_folder_only_counts_once_setup_has_finished() {
+    let dir = std::env::temp_dir().join(format!("smr-engine-test-{}", std::process::id()));
+    let engine = setup::Engine::new(&dir);
+    assert!(!engine.is_ready(), "a folder that doesn't exist");
+    engine.write_files().unwrap();
+    assert!(engine.worker().exists() && engine.config().exists());
+    assert!(!engine.is_ready(), "scripts alone, with nothing downloaded");
+    std::fs::write(dir.join("engine.json"), r#"{"version":1}"#).unwrap();
+    assert!(!engine.is_ready(), "a marker without the downloaded parts (e.g. after deleting them)");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The whole path from the app to an engine that setup installed: adopting the engine, finding its
+/// ffmpeg, starting its worker and running one recording through the queue.
+/// Needs a finished engine and a recording:
+///   SMR_TEST_ENGINE=<engine folder> SMR_TEST_FILE=<recording> cargo test engine_from_setup -- --ignored
+#[test]
+#[ignore]
+fn engine_from_setup_runs_a_recording_through_the_app() {
+    let root = PathBuf::from(std::env::var("SMR_TEST_ENGINE").expect("set SMR_TEST_ENGINE"));
+    let file = PathBuf::from(std::env::var("SMR_TEST_FILE").expect("set SMR_TEST_FILE"));
+    let out = std::env::temp_dir().join(format!("smr-app-engine-test-{}", std::process::id()));
+
+    let mut app = app();
+    app.settings.engine_root = root.to_string_lossy().into_owned();
+    app.choose_engine(false);
+    assert!(app.setup.is_none(), "a finished engine must not bring up setup");
+    assert_eq!(app.settings.engine_problem(), None);
+    assert!(Path::new(&app.settings.python).starts_with(&root));
+    assert!(tool("ffprobe").starts_with(&root) && app.ffmpeg_ok, "the engine's own ffmpeg is used");
+
+    app.settings.use_custom_folder = true;
+    app.settings.custom_folder = out.to_string_lossy().into_owned();
+    app.add_paths([file]);
+    app.start();
+    assert_eq!(app.error, None);
+    let started = Instant::now();
+    while app.batch_active && started.elapsed() < Duration::from_secs(300) {
+        app.poll_probes();
+        app.poll_worker();
+        app.dispatch();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(app.error, None, "log: {:?}", app.log);
+    let Status::Done { outputs, .. } = &app.jobs[0].status else { panic!("the recording didn't finish; log: {:?}", app.log) };
+    assert!(!outputs.is_empty() && outputs.iter().all(|f| Path::new(f).exists()), "{outputs:?}");
+    assert!(app.jobs[0].probe.as_ref().is_some_and(|p| p.is_ok()), "probed with the engine's ffprobe");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn setup_screen_follows_the_messages() {
+    use setup_ui::{SetupPhase, StepState};
+    let mut s = SetupUi::new(PathBuf::from(r"C:\engine"), setup::Gpu::default(), false);
+    s.phase = SetupPhase::Running;
+    s.apply(setup::Msg::Step { id: "packages".into(), done: false });
+    assert_eq!(s.steps[0].0, StepState::Done, "an earlier step counts as done once a later one starts");
+    assert_eq!(s.steps[1].0, StepState::Active);
+    s.apply(setup::Msg::Progress { id: "packages".into(), done: 5, total: 10 });
+    assert_eq!(s.steps[1].1, Some((5, 10)));
+
+    // Cancelling goes back to the start screen without an error.
+    s.apply(setup::Msg::Failed(setup::CANCELLED.into()));
+    assert!(matches!(s.phase, SetupPhase::Intro));
+    s.apply(setup::Msg::Failed("The drive is full.".into()));
+    assert!(matches!(&s.phase, SetupPhase::Failed(e) if e == "The drive is full."));
+    s.apply(setup::Msg::Finished { device: "CPU".into(), gpu: false });
+    assert!(s.steps.iter().all(|(state, _)| *state == StepState::Done));
+
+    assert!(setup::explain("The audio engine couldn't be downloaded", "error: Failed to fetch: connection reset").contains("internet connection"));
+    assert!(setup::explain("x", "There is not enough space on the disk. (os error 112)").contains("drive is full"));
+}
+
+#[test]
 fn text_helpers() {
     assert_eq!(fmt_eta(30.0), "under a minute");
     assert_eq!(fmt_eta(90.0 * 60.0), "1h 30m");
