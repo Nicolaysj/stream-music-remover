@@ -1,0 +1,3 @@
+[build]
+# Build outside this folder: Windows path-length limits break linking in deep folders.
+target-dir = "E:/smr-build"

@@ -1,0 +1,11 @@
+# Rust build output
+target/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
