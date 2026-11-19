@@ -31,3 +31,7 @@ The new files are saved next to each recording, with "(no music)" in the name. Y
 ## Credits
 
 The music removal is done by the Bandit v2 model from "Remastering Divide and Remaster" by Karn Watcharasupat, Chih-Wei Wu and Iroro Orife ([model weights](https://zenodo.org/records/12701995), CC BY-SA 4.0). The model code comes from [MSST-WebUI](https://github.com/SUC-DriverOld/MSST-WebUI) (AGPL-3.0), and video and audio files are handled by [ffmpeg](https://ffmpeg.org). The app downloads all three during setup.
+
+## Licence
+
+The app's own code is under the [MIT License](LICENSE). The licences of the libraries built into it, and of everything setup downloads, are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
